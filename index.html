@@ -298,7 +298,7 @@ let history = [], turn = BLACK, over = false, winLine = null;
 let cursor = 112, cursorVisible = false, hover = -1;
 
 // 联机
-let myColor = 0, linked = false, netOn = false;
+let myColor = 0, netOn = false;
 
 const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 const $ = id => document.getElementById(id);
@@ -481,14 +481,15 @@ function showVerdict(){
   const winner = winLine ? history[history.length-1].color : 0;
   $("verdictText").textContent = winner === 0 ? "满盘和局" : (winner === BLACK ? "黑方五连" : "白方五连");
   let sub = "共 " + history.length + " 手";
-  if(linked && winner) sub += (winner === myColor ? " · 你赢了" : " · 你输了");
+  if(netOn && myColor && winner) sub += (winner === myColor ? " · 你赢了" : " · 你输了");
   $("verdictSub").textContent = sub;
   $("verdict").classList.add("on");
 }
 function myTurn(){
   if(over) return false;
-  if(!linked) return true;
-  return turn === myColor;
+  if(!netOn) return true;        // 本机对下
+  if(!myColor) return false;
+  return turn === myColor;       // 联机：对方在不在线都能先把自己这手走掉
 }
 function moveList(){ return history.map(m => m.idx); }
 
@@ -501,15 +502,27 @@ function playAt(idx){
   sendState();
 }
 
-/* ── 联机：公共 MQTT 中转（不走 P2P，两边都只做对外 WSS 连接） ── */
+/* ── 联机：公共 MQTT 中转（两边都只做对外 WSS 连接，不打洞） ── */
 const TOPIC = "lianzhu15";
 const BROKERS = [
   "wss://broker.hivemq.com:8884/mqtt",
   "wss://broker.emqx.io:8084/mqtt",
 ];
+const GONE_MS = 45000;   // 这么久没动静才显示对方离开（切标签会被浏览器节流，不能判太快）
 
-let client = null, cid = null, code = null;
-let peerCid = null, peerSeen = 0, beat = null, watch = null;
+let client = null, code = null;
+let seats = null, seatTimer = null, wantBlack = false;
+let peerLive = false, peerSeen = 0, beat = null, watch = null;
+let didFresh = false, hiddenAt = 0;
+
+// 持久身份：刷新、重开页面都不变，座位就认它
+// 加 ?me=随便什么 可以在同一台电脑上开两个窗口当两个人（自己跟自己下、或调试用）
+let uid = new URLSearchParams(location.search).get("me") || "";
+if(!uid){
+  uid = read("lianzhu-uid") || "";
+  if(!uid){ uid = Math.random().toString(36).slice(2,10) + Date.now().toString(36); save("lianzhu-uid", uid); }
+}
+const GAMEKEY = "lianzhu-game-" + uid;
 
 function randCode(){
   const A = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -523,46 +536,78 @@ function setNet(msg, dotClass){
   $("netMsg").textContent = msg;
   $("netDot").className = "dot" + (dotClass ? " " + dotClass : "");
 }
+function topicOf(sub){ return TOPIC + "/" + code + "/" + sub; }
 function pub(sub, data, retain){
-  if(!client || !client.connected) return;
-  try{
-    client.publish(TOPIC + "/" + code + "/" + sub, JSON.stringify(data), {qos:0, retain: !!retain});
-  }catch(e){}
+  if(!client || !client.connected || !code) return;
+  try{ client.publish(topicOf(sub), JSON.stringify(data), {qos:0, retain: !!retain}); }catch(e){}
 }
-function sendState(){
-  if(code) pub("state", {moves: moveList(), cid: cid}, true);
-}
-function sayHello(){
-  if(code) pub("who", {cid: cid, want: myColor}, false);
-}
+function sendState(){ if(code && myColor) pub("state", {moves: moveList(), by: uid}, true); }
+function sayHello(){ if(code) pub("who", {uid: uid}, false); }
 
-function enter(c, want, fresh){
+function paired(){ return !!(seats && seats.black && seats.white); }
+
+function persist(){
+  if(!netOn || !code) return;
+  save(GAMEKEY, JSON.stringify({code: code, moves: moveList()}));
+}
+function clearSaved(){ save(GAMEKEY, ""); }
+
+function enter(c, preferBlack, fresh){
   c = (c || "").toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0,5);
   if(!c) return;
   leaveRoom(false);
 
-  code = c; cid = randId(); myColor = want;
-  peerCid = null; peerSeen = 0;
+  code = c; wantBlack = !!preferBlack; myColor = 0;
+  seats = null; peerLive = false; peerSeen = Date.now(); didFresh = !fresh;
   $("codeShow").textContent = c;
   $("codeLabel").textContent = "房间号";
   netOn = true;
   setNet("正在连接…", "busy");
   render();
-
-  openClient(0, c, fresh);
+  openClient(0);
 }
 
-// 逐个试中转服务器，某个连不上就换下一个
-function openClient(idx, c, fresh){
+// 收齐 retained 的座位表后再入座：自己坐过的位子永远还是自己的
+function claimSeat(){
+  const s = seats || {black: null, white: null};
+  if(s.black === uid)      myColor = BLACK;
+  else if(s.white === uid) myColor = WHITE;
+  else if(wantBlack && !s.black){ s.black = uid; myColor = BLACK; }
+  else if(!s.white){ s.white = uid; myColor = WHITE; }
+  else if(!s.black){ s.black = uid; myColor = BLACK; }
+  else { myColor = 0; }                      // 两个位子都被别人占了 → 观战
+  seats = s;
+  pub("seats", s, true);
+  sayHello();
+  if(myColor && history.length) sendState();
+  updateNetMsg();
+  render();
+}
+
+function updateNetMsg(){
+  if(!myColor){ setNet("这间房已经有两个人在下了，你是旁观", "bad"); return; }
+  const me = " · 你执" + (myColor === BLACK ? "黑（先手）" : "白（后手）");
+  if(!paired())      setNet("已进房间，等对方进来" + me, "busy");
+  else if(peerLive)  setNet("已连上" + me, "live");
+  else               setNet("对方暂时不在，棋局留着" + me, "bad");
+}
+
+function openClient(idx){
   const url = BROKERS[idx % BROKERS.length];
+  const c = code;
   let opened = false;
 
   client = mqtt.connect(url, {
-    clientId: "lz" + cid + randId(),
+    clientId: "lz" + uid.slice(0,6) + randId(),
     clean: true,
-    keepalive: 30,
-    reconnectPeriod: 3000,
+    keepalive: 20,
+    reconnectPeriod: 2500,
     connectTimeout: 8000,
+    will: {                                 // 页面被关掉时，由服务器替我们通知对方
+      topic: TOPIC + "/" + c + "/bye",
+      payload: JSON.stringify({uid: uid}),
+      qos: 0, retain: false,
+    },
   });
   const self = client;
 
@@ -571,7 +616,7 @@ function openClient(idx, c, fresh){
     if(idx + 1 < BROKERS.length){
       try{ self.end(true); }catch(e){}
       setNet("换一个中转服务器再试…", "busy");
-      openClient(idx + 1, c, fresh);
+      openClient(idx + 1);
     }else{
       setNet("连不上中转服务器，检查网络后重进房间", "bad");
     }
@@ -581,67 +626,103 @@ function openClient(idx, c, fresh){
     opened = true;
     self.subscribe(TOPIC + "/" + c + "/#", {qos: 0}, err => {
       if(err){ setNet("订阅失败，换个房间号再试", "bad"); return; }
-      if(fresh) pub("state", {moves: [], cid: cid}, true);   // 开新房先清掉旧局面
+      // 清空旧局面只在刚开新房时做一次；断线重连绝不能再做，否则会把正下的棋清掉
+      if(!didFresh){
+        didFresh = true;
+        seats = {black: null, white: null};
+        pub("state", {moves: [], by: uid}, true);
+        pub("seats", seats, true);
+      }
+      peerSeen = Date.now();
       sayHello();
-      setNet(linked ? liveText() : "已进房间，等对方进来", linked ? "live" : "busy");
+      clearTimeout(seatTimer);
+      seatTimer = setTimeout(claimSeat, 1500);   // 等 retained 座位表先到
+      if(myColor) updateNetMsg(); else setNet("正在进房间…", "busy");
       render();
     });
   });
-  client.on("reconnect", () => { if(!linked && opened) setNet("正在重连…", "busy"); });
+  client.on("reconnect", () => { if(opened) setNet("网络断了，正在自动重连…", "busy"); });
   client.on("error", () => { if(opened) setNet("连接出错，正在重试…", "busy"); });
-  client.on("close", () => { if(netOn && opened && !self.connected) setNet("连接断开，正在重试…", "busy"); });
+  client.on("close", () => {
+    if(netOn && opened && !self.connected) setNet("网络断了，正在自动重连…", "busy");
+  });
 
   client.on("message", (topic, payload) => {
     let d;
     try{ d = JSON.parse(payload.toString()); }catch(e){ return; }
-    if(!d || d.cid === cid) return;
+    if(!d) return;
     const kind = topic.split("/").pop();
 
-    if(kind === "who"){
-      peerCid = d.cid; peerSeen = Date.now();
-      // 两人想要同一色：cid 大的让位
-      if(d.want === myColor && cid > d.cid){
-        myColor = 3 - myColor;
-      }
-      if(!linked){
-        linked = true;
-        if(myColor === BLACK) sendState();  // 执黑的把当前局面同步过去
-      }
-      sayHello();
-      setNet(liveText(), "live");
+    if(kind === "seats"){
+      seats = {black: d.black || null, white: d.white || null};
+      if(seats.black === uid)      myColor = BLACK;
+      else if(seats.white === uid) myColor = WHITE;
+      updateNetMsg();
       render();
+    }else if(kind === "who"){
+      if(d.uid === uid) return;
+      peerSeen = Date.now();
+      if(!peerLive){ peerLive = true; updateNetMsg(); render(); }
+      // 对方刚进来时把座位表和局面再推一遍，帮他对齐
+      if(myColor){ pub("seats", seats || {}, true); sendState(); }
     }else if(kind === "state"){
-      peerCid = d.cid; peerSeen = Date.now();
+      if(d.by === uid) return;
+      peerSeen = Date.now(); peerLive = true;
       if(!Array.isArray(d.moves)) return;
       const mine = moveList();
       if(d.moves.length === mine.length && d.moves.every((v,i) => v === mine[i])) return;
       rebuild(d.moves, d.moves.length === mine.length + 1);
+      updateNetMsg();
+      render();
+    }else if(kind === "bye"){
+      if(d.uid === uid) return;
+      peerLive = false;
+      updateNetMsg();
       render();
     }
   });
 
   clearInterval(beat); clearInterval(watch);
-  beat = setInterval(sayHello, 4000);
+  beat = setInterval(() => { if(document.visibilityState === "visible") sayHello(); }, 4000);
   watch = setInterval(() => {
-    if(!linked) return;
-    if(Date.now() - peerSeen > 12000){
-      linked = false;
-      setNet("对方掉线了，棋局留着，等他回来", "bad");
+    if(!netOn || !peerLive) return;
+    if(document.visibilityState !== "visible") return;      // 自己在后台时不判断对方死活
+    if(hiddenAt && Date.now() - hiddenAt < GONE_MS) return;  // 刚回前台留缓冲
+    if(Date.now() - peerSeen > GONE_MS){
+      peerLive = false;
+      updateNetMsg();
       render();
     }
-  }, 2000);
+  }, 3000);
 }
 
-function liveText(){
-  return "已连上 · 你执" + (myColor === BLACK ? "黑（先手）" : "白（后手）");
-}
 function leaveRoom(resetBoard){
-  clearInterval(beat); clearInterval(watch);
-  beat = watch = null;
-  if(client){ try{ client.end(true); }catch(e){} client = null; }
-  linked = false; peerCid = null; code = null; netOn = false;
-  if(resetBoard){ myColor = 0; rebuild([], false); }
+  clearInterval(beat); clearInterval(watch); clearTimeout(seatTimer);
+  beat = watch = seatTimer = null;
+  if(client){
+    try{ if(client.connected && code) client.publish(topicOf("bye"), JSON.stringify({uid: uid})); }catch(e){}
+    try{ client.end(true); }catch(e){}
+    client = null;
+  }
+  peerLive = false; seats = null; code = null; netOn = false; didFresh = false;
+  if(resetBoard){ myColor = 0; clearSaved(); rebuild([], false); }
 }
+
+/* 切走再切回来：浏览器会把后台页面的定时器掐到几乎不跑，回来要主动接上 */
+document.addEventListener("visibilitychange", () => {
+  if(document.visibilityState === "hidden"){ hiddenAt = Date.now(); return; }
+  hiddenAt = Date.now();
+  if(!netOn || !code) return;
+  peerSeen = Date.now();
+  if(client && !client.connected){
+    setNet("正在重新连上…", "busy");
+    try{ client.reconnect(); }catch(e){}
+  }else{
+    sayHello();
+    sendState();
+  }
+  render();
+});
 
 /* ── 操作 ───────────────────────────── */
 function undo(){
@@ -663,7 +744,7 @@ function render(){
   if(over){
     main = winLine ? (history[history.length-1].color === BLACK ? "黑方胜" : "白方胜") : "和局";
     sub = "共 " + history.length + " 手";
-  }else if(linked){
+  }else if(netOn){
     main = turn === myColor ? "轮到你了" : "等待对方落子";
     waiting = turn !== myColor;
     sub = "你执" + (myColor === BLACK ? "黑" : "白") + " · 第 " + (history.length+1) + " 手";
@@ -677,11 +758,11 @@ function render(){
   const idle = !netOn;
   $("viewIdle").style.display = idle ? "" : "none";
   $("viewNet").style.display = idle ? "none" : "";
-  $("netTitle").textContent = linked ? "联机对战 · 已连接" : "联机对战";
+  $("netTitle").textContent = (paired() && peerLive) ? "联机对战 · 已连接" : "联机对战";
   $("undoBtn").disabled = !history.length;
   $("localUndo").style.display = idle ? "" : "none";
   $("localReset").style.display = idle ? "" : "none";
-  $("netNote").style.display = (netOn && !linked) ? "" : "none";
+  $("netNote").style.display = (netOn && !paired()) ? "" : "none";
 
   const rec = $("record");
   if(!history.length){
@@ -693,6 +774,7 @@ function render(){
     ).join("") + "</ol>";
     rec.scrollTop = rec.scrollHeight;
   }
+  persist();
   draw();
 }
 
@@ -733,9 +815,9 @@ canvas.addEventListener("keydown", ev => {
 });
 canvas.addEventListener("blur", () => { cursorVisible = false; draw(); });
 
-$("hostBtn").addEventListener("click", () => enter(randCode(), BLACK, true));
-$("joinBtn").addEventListener("click", () => enter($("codeInput").value, WHITE, false));
-$("codeInput").addEventListener("keydown", ev => { if(ev.key === "Enter") enter($("codeInput").value, WHITE, false); });
+$("hostBtn").addEventListener("click", () => enter(randCode(), true, true));
+$("joinBtn").addEventListener("click", () => enter($("codeInput").value, false, false));
+$("codeInput").addEventListener("keydown", ev => { if(ev.key === "Enter") enter($("codeInput").value, false, false); });
 $("hangupBtn").addEventListener("click", () => { leaveRoom(true); render(); });
 $("undoBtn").addEventListener("click", undo);
 $("resetBtn").addEventListener("click", restart);
@@ -770,7 +852,18 @@ render();
 
 // 用 ?room=XXXXX 打开可以直接加入
 const qs = new URLSearchParams(location.search).get("room");
-if(qs) enter(qs, WHITE, false);
+if(qs){
+  enter(qs, false, false);
+}else{
+  try{
+    const g = JSON.parse(read(GAMEKEY) || "null");
+    if(g && g.code && Array.isArray(g.moves)){
+      enter(g.code, false, false);
+      rebuild(g.moves, false);
+      render();
+    }
+  }catch(e){}
+}
 })();
 </script>
 </body>
